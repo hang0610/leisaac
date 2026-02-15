@@ -1,5 +1,7 @@
+import json
 import pickle
 import time
+from pathlib import Path
 
 import grpc
 import numpy as np
@@ -183,7 +185,7 @@ class Gr00t16ServicePolicyClient(ZMQServicePolicy):
 class LeRobotServicePolicyClient(Policy):
     """
     Service policy client for Lerobot: https://github.com/huggingface/lerobot
-    Target Commit: https://github.com/huggingface/lerobot/tree/v0.3.3
+    Target Commit: https://github.com/huggingface/lerobot/tree/v0.4.3
     """
 
     def __init__(
@@ -227,13 +229,19 @@ class LeRobotServicePolicyClient(Policy):
             self.last_action = np.zeros((1, 6))
         # TODO: add bi-arm support
 
-        for camera_key, camera_image_shape in camera_infos.items():
-            lerobot_features[f"observation.images.{camera_key}"] = {
+        # Load rename_map from checkpoint; policy may expect renamed keys (e.g. camera1, camera2) not env keys (front, wrist)
+        rename_map = self._load_rename_map_from_checkpoint(pretrained_name_or_path)
+        self._env_to_policy_key = self._env_camera_keys_to_policy_keys(rename_map, list(camera_infos.keys()))
+
+        for env_camera_key, camera_image_shape in camera_infos.items():
+            # Use policy key so server's policy_image_features has matching keys (avoids KeyError 'observation.images.wrist')
+            send_key = self._env_to_policy_key.get(env_camera_key, env_camera_key)
+            lerobot_features[f"observation.images.{send_key}"] = {
                 "dtype": "image",
                 "shape": (camera_image_shape[0], camera_image_shape[1], 3),
                 "names": ["height", "width", "channels"],
             }
-        self.camera_keys = list(camera_infos.keys())
+        self.camera_keys = list(camera_infos.keys())  # env keys for reading from observation_dict
 
         self.policy_config = RemotePolicyConfig(
             policy_type,
@@ -265,10 +273,39 @@ class LeRobotServicePolicyClient(Policy):
         except grpc.RpcError:
             raise RuntimeError("Failed to connect to policy server")
 
+    @staticmethod
+    def _load_rename_map_from_checkpoint(pretrained_name_or_path: str) -> dict:
+        """Load rename_map from policy_preprocessor.json (e.g. observation.images.front -> observation.images.camera1)."""
+        path = Path(pretrained_name_or_path) / "policy_preprocessor.json"
+        if not path.exists():
+            return {}
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+            for step in cfg.get("steps", []):
+                if step.get("registry_name") == "rename_observations_processor":
+                    return step.get("config", {}).get("rename_map", {})
+        except Exception:
+            pass
+        return {}
+
+    @staticmethod
+    def _env_camera_keys_to_policy_keys(rename_map: dict, env_camera_keys: list[str]) -> dict[str, str]:
+        """Map env camera keys to policy-expected keys using rename_map so server sees camera1/camera2 not front/wrist."""
+        prefix = "observation.images."
+        out = {}
+        for env_key in env_camera_keys:
+            old_full = f"{prefix}{env_key}"
+            new_full = rename_map.get(old_full, old_full)
+            out[env_key] = new_full[len(prefix):] if new_full.startswith(prefix) else env_key
+        return out
+
     def _send_observation(self, observation_dict: dict):
-        raw_observation = {
-            f"{key}": observation_dict[key].cpu().numpy().astype(np.uint8)[0] for key in self.camera_keys
-        }
+        # Send under policy-expected keys (camera1, camera2) so server's policy_image_features match
+        raw_observation = {}
+        for env_key in self.camera_keys:
+            send_key = self._env_to_policy_key.get(env_key, env_key)
+            raw_observation[send_key] = observation_dict[env_key].cpu().numpy().astype(np.uint8)[0]
         raw_observation["task"] = observation_dict["task_description"]
 
         if self.task_type == "so101leader":
@@ -320,7 +357,7 @@ class LeRobotServicePolicyClient(Policy):
             self._send_observation(observation_dict)
         action_chunk = self._receive_action()
         if action_chunk is None:
-            self.skip_send_observation = True
+            # self.skip_send_observation = True
             return torch.from_numpy(self.last_action).repeat(self.actions_per_chunk, 1)[:, None, :]
 
         action_list = [action.get_action()[None, :] for action in action_chunk]

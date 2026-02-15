@@ -78,3 +78,9 @@ assets/robots/*
 
 # greenscreen
 greenscreen/*
+
+# checkpoints
+checkpoints/
+
+# demo data
+demo_data/
